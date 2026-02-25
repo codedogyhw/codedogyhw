@@ -1,0 +1,40 @@
+from pm4py.objects.petri_net import semantics
+
+
+class PartialReachabilityGraph:
+    """
+    部分可达性图 (PRG)
+    功能：动态缓存 Marking -> Enabled Transitions 和 Marking -> Next Marking 的映射。
+    """
+
+    def __init__(self, net):
+        self.net = net
+        # 缓存：Marking -> List[Transition]
+        self.enabled_transitions_cache = {}
+        # 缓存：(Marking, Transition) -> NewMarking
+        self.execution_cache = {}
+
+    def get_enabled_transitions(self, marking):
+        if marking in self.enabled_transitions_cache:
+            return self.enabled_transitions_cache[marking]
+
+        enabled = semantics.enabled_transitions(self.net, marking)
+        self.enabled_transitions_cache[marking] = enabled
+        return enabled
+
+    def fire_transition(self, marking, transition):
+        cache_key = (marking, transition)
+        if cache_key in self.execution_cache:
+            return self.execution_cache[cache_key]
+
+        new_marking = semantics.execute(transition, self.net, marking)
+        self.execution_cache[cache_key] = new_marking
+
+        # 预热新状态的使能变迁，加速后续访问
+        if new_marking not in self.enabled_transitions_cache:
+            self.get_enabled_transitions(new_marking)
+
+        return new_marking
+
+    def get_cache_size(self):
+        return len(self.enabled_transitions_cache), len(self.execution_cache)
