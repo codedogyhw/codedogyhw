@@ -1,0 +1,30 @@
+import pm4py
+from pm4py.objects.log.importer.xes import importer as xes_importer
+from pm4py.algo.discovery.inductive import algorithm as inductive_miner
+from pm4py.objects.conversion.process_tree import converter as pt_converter
+
+
+class DataLoader:
+    @staticmethod
+    def load_log(file_path):
+        print(f"正在加载日志: {file_path}...")
+        log = xes_importer.apply(file_path)
+        return log
+
+    @staticmethod
+    def discover_model(log, noise_threshold=0.0):
+        """
+        使用IM算法挖掘Petri网。
+        noise_threshold: 过滤低频行为的阈值 (0.0-1.0)
+        """
+        print(f"正在挖掘Petri网模型 (Noise Threshold={noise_threshold})...")
+
+        # 使用 inductive miner infrequent 变体
+        tree = inductive_miner.apply(
+            log,
+            variant=inductive_miner.Variants.IMf,
+            parameters={"noise_threshold": noise_threshold}
+        )
+
+        net, initial_marking, final_marking = pt_converter.apply(tree)
+        return net, initial_marking, final_marking
