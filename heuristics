@@ -3,22 +3,14 @@ class CostEstimator:
         self.global_info = global_info
 
     def calculate_h_score(self, current_marking, trace, trace_index):
-        """
-        3.3 基于关键活动的启发式函数
-        公式：h = |KA_M \setminus Set(sigma_rem)|
-        """
-        # 1. 获取当前状态的关键活动集合 (KA)
         ka_set = self.global_info.ka_map.get(current_marking, set())
 
         if not ka_set:
             return 0
 
-        # 2. 获取剩余轨迹的活动集合
         remaining_trace = trace[trace_index:] if trace_index < len(trace) else []
         remaining_trace_set = set(remaining_trace)
 
-        # 3. 集合差集运算：计算缺失的活动数量
-        # 统计存在于 KA 中但不在剩余轨迹中的活动
         missing_count = 0
         for ka in ka_set:
             if ka not in remaining_trace_set:
