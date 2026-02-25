@@ -1,0 +1,205 @@
+import heapq
+from dataclasses import dataclass, field
+from typing import Any
+from .utils import AlignmentCosts, is_tau_transition
+
+
+@dataclass
+class SearchNode:
+    f_score: float
+    g_score: float = field(compare=False)
+    marking: Any = field(compare=False)
+    trace_idx: int = field(compare=False)
+    path: list = field(compare=False, default_factory=list)
+
+    # [核心优化] Tie-Breaking: 当 f 相同时，优先处理 g 更大的节点 (DFS 行为)
+    # 这能显著减少在等价路径上的宽度扩展，快速收敛到终点
+    def __lt__(self, other):
+        if abs(self.f_score - other.f_score) > 1e-6:
+            return self.f_score < other.f_score
+        return self.g_score > other.g_score
+
+
+class GreedyAligner:
+    """
+    3.3.1 基于成本上界的剪枝 - 贪婪算法部分
+    """
+
+    def __init__(self, prg, heuristics):
+        self.prg = prg
+        self.heuristics = heuristics
+        self.costs = AlignmentCosts
+
+    def get_upper_bound(self, trace):
+        current_marking = self.heuristics.global_info.initial_marking
+
+        open_set = []
+        h_init = self.heuristics.calculate_h_score(current_marking, trace, 0)
+        heapq.heappush(open_set, SearchNode(h_init, 0, current_marking, 0, []))
+
+        visited = set()
+        steps = 0
+        # 适当增加步数限制，确保贪婪能跑完较长的 Noisy 轨迹
+        max_steps = len(trace) * 50
+
+        best_g_so_far = float('inf')
+
+        while open_set and steps < max_steps:
+            steps += 1
+            current = heapq.heappop(open_set)
+
+            state_key = (current.marking, current.trace_idx)
+            if state_key in visited: continue
+            visited.add(state_key)
+
+            is_done = current.trace_idx >= len(trace)
+            enabled = self.prg.get_enabled_transitions(current.marking)
+
+            if is_done and not enabled:
+                return current.g_score  # 找到可行解
+
+            candidates = []
+
+            # Model Moves
+            for t in enabled:
+                nm = self.prg.fire_transition(current.marking, t)
+                is_tau = is_tau_transition(t)
+                cost = self.costs.MODEL_MOVE if not is_tau else self.costs.TAU_MOVE
+                is_sync = False
+                if not is_done and t.label == trace[current.trace_idx]: is_sync = True
+
+                if is_sync:
+                    g = current.g_score + self.costs.SYNC_MOVE
+                    h = self.heuristics.calculate_h_score(nm, trace, current.trace_idx + 1)
+                    candidates.append(SearchNode(g + h, g, nm, current.trace_idx + 1))
+                else:
+                    g = current.g_score + cost
+                    h = self.heuristics.calculate_h_score(nm, trace, current.trace_idx)
+                    candidates.append(SearchNode(g + h, g, nm, current.trace_idx))
+
+            # Log Moves
+            if not is_done:
+                g = current.g_score + self.costs.LOG_MOVE
+                h = self.heuristics.calculate_h_score(current.marking, trace, current.trace_idx + 1)
+                candidates.append(SearchNode(g + h, g, current.marking, current.trace_idx + 1))
+
+            if candidates:
+                # 贪婪策略：只选 f 最小的
+                candidates.sort(key=lambda x: x.f_score)
+                # 添加一点随机性或 beam search 可以防止死循环，这里保持简单贪婪
+                heapq.heappush(open_set, candidates[0])
+
+        # [兜底策略] 如果贪婪超时，返回一个保守的有限上界，而不是 inf
+        # 估算：当前已花代价 + 剩余全部 Log Move + 剩余模型估算
+        # 这虽然大，但比 inf 强，能剪掉极端离谱的路径
+        fallback = len(trace) * 5 + 100
+        return fallback
+
+
+class AStarAligner:
+    def __init__(self, prg, heuristics):
+        self.prg = prg
+        self.heuristics = heuristics
+        self.costs = AlignmentCosts
+        self.visited_count = 0
+
+    def align(self, trace, upper_bound=float('inf')):
+        self.visited_count = 0
+        initial_marking = self.heuristics.global_info.initial_marking
+
+        open_set = []
+        h_init = self.heuristics.calculate_h_score(initial_marking, trace, 0)
+        start_node = SearchNode(f_score=h_init, g_score=0, marking=initial_marking, trace_idx=0)
+        heapq.heappush(open_set, start_node)
+
+        closed_set = {}
+        # best_solution = None # 不需要存储，找到即返回
+
+        while open_set:
+            current = heapq.heappop(open_set)
+            self.visited_count += 1
+
+            # (1) 上界剪枝
+            # 必须是 >，如果 == 还要继续，因为可能就是最优解
+            if current.f_score > upper_bound:
+                continue
+
+            state_key = (current.marking, current.trace_idx)
+            if state_key in closed_set and closed_set[state_key] <= current.g_score:
+                continue
+            closed_set[state_key] = current.g_score
+
+            is_done = current.trace_idx >= len(trace)
+            enabled_trans = self.prg.get_enabled_transitions(current.marking)
+
+            # [找到即停] 关键优化
+            if is_done and not enabled_trans:
+                return current.path, current.g_score
+
+            # === 3.4 剪枝策略 ===
+            force_log_move = False
+            force_model_moves = set()
+            log_move_forbidden = False
+            remaining_trace_set = set(trace[current.trace_idx:])
+
+            # ii. 模型角度强剪枝 (SRModel)
+            enabled_labels = {t.label for t in enabled_trans if t.label is not None}
+            if enabled_labels and not enabled_labels.intersection(remaining_trace_set):
+                force_model_moves = set(enabled_trans)
+                log_move_forbidden = True
+
+            # i. 日志角度剪枝 (SRLog)
+            if not is_done and not log_move_forbidden:
+                next_act = trace[current.trace_idx]
+                alive = self.heuristics.global_info.alive_activities_map.get(current.marking, set())
+                if alive and next_act not in alive:
+                    force_log_move = True
+
+            # A. Log Moves
+            if (force_log_move or (not log_move_forbidden and not force_model_moves)) and not is_done:
+                new_g = current.g_score + self.costs.LOG_MOVE
+                new_trace_idx = current.trace_idx + 1
+                new_path = current.path + [("LOG", trace[current.trace_idx])]
+                new_h = self.heuristics.calculate_h_score(current.marking, trace, new_trace_idx)
+
+                if new_g + new_h <= upper_bound:
+                    heapq.heappush(open_set, SearchNode(new_g + new_h, new_g, current.marking, new_trace_idx, new_path))
+
+            # B. Model Moves
+            if not force_log_move:
+                targets = []
+                if force_model_moves:
+                    targets = list(force_model_moves) + [t for t in enabled_trans if t.label is None]
+                    targets = list(set(targets))
+                else:
+                    targets = list(enabled_trans)
+
+                for t in targets:
+                    # 简单的分支预判剪枝
+                    if not force_model_moves and not is_tau_transition(t):
+                        preview_marking = self.prg.fire_transition(current.marking, t)
+                        current_ka = self.heuristics.global_info.ka_map.get(current.marking, set())
+                        # 如果当前有必须执行的KA，但走了这步之后，KA在未来变得不可达(不在Alive中)，则剪枝
+                        # 注意：这里取 alive 需要取 preview_marking 的 alive
+                        future_alive = self.heuristics.global_info.alive_activities_map.get(preview_marking, set())
+                        if current_ka and not current_ka.intersection(future_alive):
+                            continue
+
+                    new_marking = self.prg.fire_transition(current.marking, t)
+                    is_sync = False
+                    if not is_done and t.label == trace[current.trace_idx]: is_sync = True
+                    if log_move_forbidden: is_sync = False
+
+                    cost = self.costs.SYNC_MOVE if is_sync else (
+                        self.costs.MODEL_MOVE if not is_tau_transition(t) else self.costs.TAU_MOVE)
+                    new_idx = current.trace_idx + 1 if is_sync else current.trace_idx
+                    path_type = "SYNC" if is_sync else "MODEL"
+
+                    new_path = current.path + [(path_type, t.label)]
+                    new_g = current.g_score + cost
+                    new_h = self.heuristics.calculate_h_score(new_marking, trace, new_idx)
+
+                    if new_g + new_h <= upper_bound:
+                        heapq.heappush(open_set, SearchNode(new_g + new_h, new_g, new_marking, new_idx, new_path))
+
+        return [], float('inf')
