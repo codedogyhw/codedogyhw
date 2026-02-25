@@ -13,13 +13,9 @@ class DataLoader:
 
     @staticmethod
     def discover_model(log, noise_threshold=0.0):
-        """
-        使用IM算法挖掘Petri网。
-        noise_threshold: 过滤低频行为的阈值 (0.0-1.0)
-        """
+
         print(f"正在挖掘Petri网模型 (Noise Threshold={noise_threshold})...")
 
-        # 使用 inductive miner infrequent 变体
         tree = inductive_miner.apply(
             log,
             variant=inductive_miner.Variants.IMf,
