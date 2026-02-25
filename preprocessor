@@ -1,41 +1,25 @@
 import sys
 from collections import defaultdict
 
-# 增加递归深度，防止BPI 2017等深度模型导致栈溢出
 sys.setrecursionlimit(20000)
 
 
 class GlobalInfoManager:
     def __init__(self, prg, initial_marking, final_marking):
-        """
-        初始化全局信息管理器
-        :param prg: 结构化可达性图 (SRG) 对象
-        :param initial_marking: 初始标记
-        :param final_marking: 结束标记
-        """
         self.prg = prg
         self.initial_marking = initial_marking
         self.final_marking = final_marking
 
-        # 3.2(1) 关键活动集合 KA(M)
-        # Mapping: Marking -> Set[ActivityLabel]
         self.ka_map = {}
 
-        # 3.2(2) 活变迁集合 Alive(M)
-        # Mapping: Marking -> Set[ActivityLabel]
         self.alive_activities_map = {}
 
-        # 用于递归中检测环的路径集合 (防止无限递归)
         self._current_path_markings = set()
 
     def preprocess(self):
-        """执行文档 3.2 描述的全局预处理"""
-        print("预处理 1/2: 构建PRG并识别关键活动 (KA)...")
-        # 清空缓存
         self.ka_map = {}
         self._current_path_markings = set()
 
-        # 启动递归计算 (同时构建 SRG 骨架)
         self._calculate_ka_recursive(self.initial_marking)
 
         print(f"KA识别完成，共探索状态数: {len(self.ka_map)}")
@@ -45,128 +29,74 @@ class GlobalInfoManager:
         print("预处理全部完成。")
 
     def _calculate_ka_recursive(self, marking):
-        """
-        3.2(1) 寻找关键活动的递归函数
-        包含核心优化：
-        1. 记忆化搜索
-        2. 闭环检测（回退机制）
-        3. 【关键】并发结构序列化：解决BPI 2017运行慢的问题
-        """
 
-        # --- 1. 记忆化与终止条件 ---
-
-        # 如果已经算过这个状态，直接返回缓存结果
         if marking in self.ka_map:
             return self.ka_map[marking]
 
-        # 【闭环检测】：如果当前状态已经在正在探索的路径上
-        # 说明我们绕了一圈回来了，这是一条死胡同分支，返回 None
         if marking in self._current_path_markings:
             return None
 
-        # 【到达终点】：成功！
-        # 返回空集合，表示"后续不需要做任何额外的事了"
         if marking == self.final_marking:
             self.ka_map[marking] = set()
             return set()
 
-        # --- 2. 递归探索 ---
-
-        # 将当前状态加入路径历史
         self._current_path_markings.add(marking)
 
-        # 获取使能变迁 (SRG会在这里动态构建)
         enabled_trans = self.prg.get_enabled_transitions(marking)
 
-        # 【死锁检测】：如果无路可走且不是终点
         if not enabled_trans:
             self._current_path_markings.remove(marking)
             return None
 
-        # =========================================================
-        # 【核心优化】并发序列化策略 (Canonical Serialization)
-        # 如果 Token 数 > 1，说明处于并发区域。
-        # BPI 2017 包含大量并发，如果不限制，分支数会爆炸。
-        # 策略：强制只走其中一条路（按排序取第一个）。
-        # =========================================================
         is_concurrency = len(marking) > 1
 
         transitions_to_explore = []
 
         if is_concurrency:
-            # 并发状态：只选一个变迁进行扩展，避免生成所有交错序列
-            # 使用 label 或 id 排序保证确定性
             sorted_trans = sorted(list(enabled_trans), key=lambda x: str(x.label) if x.label else str(id(x)))
             transitions_to_explore = [sorted_trans[0]]
         else:
-            # 顺序/选择状态：必须探索所有分支以寻找交集
             transitions_to_explore = list(enabled_trans)
 
-        valid_branch_results = []  # 存储所有有效分支的结果
+        valid_branch_results = []
 
-        # 遍历选定的分支
         for t in transitions_to_explore:
             next_marking = self.prg.fire_transition(marking, t)
 
-            # 递归调用
             res = self._calculate_ka_recursive(next_marking)
 
-            # --- 回退判定 ---
             if res is None:
-                continue  # 这条路是死路，忽略
-            else:
-                # 路径有效，收集结果
-                branch_set = res.copy()
-                if t.label is not None:
-                    branch_set.add(t.label)
-                valid_branch_results.append(branch_set)
+                continue 
 
-        # 回溯：当前状态处理完毕，移出路径历史
         self._current_path_markings.remove(marking)
 
-        # --- 3. 结果汇总 (交集) ---
-
         if not valid_branch_results:
-            # 所有尝试的分支都走不通
             return None
 
-        # 【取交集】：关键活动是所有有效路径上"共有"的活动
         intersection_set = set.intersection(*valid_branch_results)
 
-        # 存入缓存并返回
         self.ka_map[marking] = intersection_set
         return intersection_set
 
     def _calculate_alive_activities(self):
-        """
-        3.2(2) 计算活变迁集合 (Alive Activities)
-        修复了之前的 '不可达代码' 问题，采用线性流程。
-        """
-        # 1. 安全检查 (Guard Clause)
+
         if not hasattr(self.prg, 'execution_cache'):
             print("Error: PRG object missing 'execution_cache'. Cannot calculate Alive activities.")
             return
 
         all_markings = set()
-        # 构建反向图: Next_Marking -> List[Pre_Marking]
-        predecessors = defaultdict(list)
 
-        # 2. 从 PRG 缓存中提取所有已探索的状态和边
         for (m, t), next_m in self.prg.execution_cache.items():
             all_markings.add(m)
             all_markings.add(next_m)
             predecessors[next_m].append(m)
 
-        # 3. 初始化：每个状态的 Alive 初始值为其直接使能的非静默变迁
-        # (这段代码现在是绝对可达的)
         for m in all_markings:
             enabled = self.prg.get_enabled_transitions(m)
             self.alive_activities_map[m] = {t.label for t in enabled if t.label is not None}
 
-        # 4. 迭代传播 (直到收敛，处理循环)
         changed = True
         iter_count = 0
-        # 设置安全上限
         max_iter = len(all_markings) * 5
 
         print(f"开始计算 Alive 集合，涉及状态数: {len(all_markings)}")
@@ -175,19 +105,14 @@ class GlobalInfoManager:
             changed = False
             iter_count += 1
 
-            # 遍历反向图进行传播
             for m_target, preds in predecessors.items():
                 target_alive = self.alive_activities_map.get(m_target, set())
 
-                # 如果后继节点没有任何活变迁，则无需传播
                 if not target_alive:
                     continue
 
                 for m_source in preds:
                     source_alive = self.alive_activities_map[m_source]
-
-                    # 并集逻辑：如果后继能做更多事，前驱也能做
-                    # Alive[Source] = Alive[Source] U Alive[Target]
                     if not target_alive.issubset(source_alive):
                         self.alive_activities_map[m_source] = source_alive.union(target_alive)
                         changed = True
