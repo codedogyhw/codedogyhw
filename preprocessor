@@ -40,8 +40,6 @@ class GlobalInfoManager:
             self.ka_map[marking] = set()
             return set()
 
-        self._current_path_markings.add(marking)
-
         enabled_trans = self.prg.get_enabled_transitions(marking)
 
         if not enabled_trans:
